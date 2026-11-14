@@ -286,6 +286,22 @@ cdef extern from "lexbor/html/html.h" nogil:
     lxb_html_element_t* lxb_html_element_inner_html_set(lxb_html_element_t *element,
                                                         const lxb_char_t *html, size_t size)
 
+cdef extern from "lexbor/html/source_position.h" nogil:
+    ctypedef struct lxb_html_source_position_registry_t
+
+    ctypedef enum lxb_html_source_origin_t:
+        LXB_HTML_SOURCE_ORIGIN_DOCUMENT = 0x00
+        LXB_HTML_SOURCE_ORIGIN_FRAGMENT = 0x01
+        LXB_HTML_SOURCE_ORIGIN_SYNTHETIC = 0x02
+
+    lxb_html_source_position_registry_t *lxb_html_document_source_position_enable(
+        lxb_html_document_t *document, lxb_html_source_origin_t origin
+    )
+    lxb_status_t lxb_html_document_push_source_origin(
+        lxb_html_document_t *document, lxb_html_source_origin_t origin
+    )
+    void lxb_html_document_pop_source_origin(lxb_html_document_t *document)
+
 cdef class LexborNode:
     cdef:
         lxb_dom_node_t *node
@@ -331,14 +347,15 @@ cdef class LexborHTMLParser:
     cdef inline lxb_dom_node_t* _fragment_root_node(self)
     cdef inline lxb_dom_node_t* _tag_search_root(self)
     cdef inline lxb_status_t _parse_html_document(self, char *html, size_t html_len) noexcept nogil
-    cdef lxb_dom_node_t* _parse_fragment_wrapper_noi(self, char *html, size_t html_len,
+    cdef lxb_dom_node_t* _parse_fragment_wrapper_noi(self, const lxb_char_t *html, size_t html_len,
                                                      lxb_status_t *out_status) noexcept nogil
-    cdef inline lxb_status_t _parse_html_fragment(self, char *html, size_t html_len) noexcept nogil
+    cdef inline lxb_status_t _parse_html_fragment(self, const lxb_char_t *html, size_t html_len) noexcept nogil
     cdef int _parse_html(self, char *html, size_t html_len) except -1
     cdef inline LexborNode _fragment_content_node(self)
     cdef void _replace_fragment_children(self, const lxb_char_t *html, size_t html_len) except *
     cdef inline void _mark_mutated(self) noexcept
     cdef unsigned long _mutation_count
+    cdef bint _source_positions
     cdef object cached_script_texts
     cdef object cached_script_srcs
 
@@ -475,6 +492,48 @@ cdef extern from *:
     """
     lxb_dom_node_t *selectolax_template_content(lxb_dom_node_t *node) nogil
     lxb_dom_node_t *selectolax_template_content_host(lxb_dom_node_t *content) nogil
+
+
+# Source positions are read through an accessor rather than by declaring the
+# full record struct: only the three scalar fields are needed, and the accessor
+# performs the magic check that keeps a recycled node->user pointer from being
+# mistaken for a position record.
+cdef extern from *:
+    """
+    #include "lexbor/html/source_position.h"
+
+    static inline int
+    selectolax_source_position_get(lxb_dom_node_t *node,
+                                   lxb_html_source_origin_t *origin,
+                                   size_t *start, size_t *end)
+    {
+        lxb_html_source_position_t *position;
+
+        position = lxb_html_source_position_get(node);
+        if (position == NULL) {
+            return 0;
+        }
+
+        *origin = position->origin;
+        *start = position->start;
+        *end = position->end;
+
+        return 1;
+    }
+
+    static inline int
+    selectolax_has_source_registry(void *user)
+    {
+        return lxb_html_source_position_registry(user) != NULL;
+    }
+    """
+    bint selectolax_source_position_get(
+        lxb_dom_node_t *node,
+        lxb_html_source_origin_t *origin,
+        size_t *start,
+        size_t *end,
+    ) nogil
+    bint selectolax_has_source_registry(void *user) nogil
 
 
 cdef extern from "lexbor/dom/interfaces/element.h" nogil:

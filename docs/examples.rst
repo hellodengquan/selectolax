@@ -232,6 +232,88 @@ assignment and fragments parsed with ``is_fragment=True``. ``clone()`` keeps it:
 
     None
 
+Source Positions
+----------------
+
+The parser repairs the input the way a browser does: it inserts missing
+``<html>``/``<head>``/``<body>`` elements, closes unclosed tags and moves
+mis-nested table nodes. Pass ``source_positions=True`` to also record where
+each repaired node came from in the input. Each node then exposes a
+``NodeSourcePosition`` through ``source_position`` holding half-open byte
+offsets (``start`` inclusive, ``end`` exclusive) into the UTF-8 input. The
+feature is opt-in and costs nothing when left off, in which case every node
+reports ``None``.
+
+.. code-block:: python
+
+    from selectolax.lexbor import LexborHTMLParser
+
+    html = b"<div><span>x"  # note the missing closing tags
+    parser = LexborHTMLParser(html, source_positions=True)
+
+    span = parser.css_first("span")
+    position = span.source_position
+    print(position)
+    print(html[position.start:position.end])
+
+    # Text nodes are located too.
+    text = span.first_child.source_position
+    print(html[text.start:text.end])
+
+**Output:**
+
+.. code-block:: text
+
+    NodeSourcePosition(origin='document', start=5, end=11)
+    b'<span>'
+    b'x'
+
+Nodes the parser invents still get a stable position: they point at the real
+token that triggered their creation, so an implicit ``<head>`` or a node moved
+by table foster parenting never returns a null or dangling location. The
+``origin`` field says which input the offsets index - ``"document"`` for a
+normal parse and ``"fragment"`` for ``is_fragment=True``, both measured from
+the start of their own input:
+
+.. code-block:: python
+
+    from selectolax.lexbor import LexborHTMLParser
+
+    fragment = LexborHTMLParser(b"<div>a</div>", is_fragment=True,
+                                source_positions=True)
+    print(fragment.root.source_position.origin)
+    print(fragment.root.source_position.start)
+
+**Output:**
+
+.. code-block:: text
+
+    fragment
+    0
+
+A position describes where a node was parsed, so nodes created or copied after
+parsing cannot be located and report ``None``. A node that is merely unlinked
+by an edit keeps its historical position, because the records live in a pool
+that is independent of node memory:
+
+.. code-block:: python
+
+    from selectolax.lexbor import LexborHTMLParser
+
+    parser = LexborHTMLParser(b"<div><i>x</i></div>", source_positions=True)
+    italic = parser.css_first("i")
+    history = italic.source_position
+
+    print(parser.create_node("em").source_position)   # created, not parsed
+    print(italic.clone().source_position)             # a copy
+
+    italic.unwrap()
+    print(italic.source_position == history)          # unlinked keeps history
+
+Content supplied to ``inner_html`` is parsed separately; its nodes are marked
+``"synthetic"`` and their offsets index that new content rather than
+``raw_html``.
+
 CSS Selectors
 -------------
 

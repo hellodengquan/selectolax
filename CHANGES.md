@@ -1,5 +1,16 @@
 # selectolax Changelog
 
+# Unreleased
+
+- Add optional source-position tracking. Pass `source_positions=True` to
+  `LexborHTMLParser` to record where each parsed node came from in the input;
+  read it through `LexborNode.source_position`, which returns a
+  `NodeSourcePosition` with half-open byte offsets (`start`, `end`) and an
+  `origin` of `"document"`, `"fragment"` or `"synthetic"`. It is opt-in, so a
+  default parse and every existing call are unchanged, and nodes created or
+  copied after parsing (`create_node`, `clone`, imported or inserted nodes)
+  report `None`. Unlinked nodes keep the position they were parsed with.
+
 # Version 1.0.2
 
 Bugfix release for 1.0.1.

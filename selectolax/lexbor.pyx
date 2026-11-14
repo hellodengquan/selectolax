@@ -24,6 +24,7 @@ include "lexbor/selection.pxi"
 include "lexbor/util.pxi"
 include "lexbor/node_remove.pxi"
 include "lexbor/fragment_lookup.pxi"
+include "lexbor/source_position.pxi"
 
 
 class LexborDocumentOptions(IntFlag):
@@ -290,6 +291,7 @@ cdef class LexborHTMLParser:
         options: int = 0,
         encoding: bool = False,
         scripting: bool = False,
+        source_positions: bool = False,
     ):
         """Create a parser and load HTML.
 
@@ -413,15 +415,34 @@ cdef class LexborHTMLParser:
             The flag also applies to HTML parsed into the document later, such
             as an ``inner_html`` assignment, and :meth:`clone` keeps it.
 
+        source_positions : bool, optional
+            Record where each parsed node came from in the input. Defaults to
+            ``False``.
+
+            When enabled, every node the parser creates - including ones the
+            browser-style repair invents, such as implicitly inserted
+            ``<html>``/``<head>``/``<body>``, closed elements and table nodes
+            moved by foster parenting - gets a :class:`NodeSourcePosition`
+            reachable through :attr:`LexborNode.source_position`. Offsets are
+            byte positions into the UTF-8 input; for a full-document parse they
+            index ``raw_html``, for a fragment they index the fragment input.
+            Nodes created or copied after parsing (``create_node``,
+            ``clone``, node moves) have no source and report ``None``.
+
+            Leaving it off costs nothing: no position records are allocated and
+            every node reports ``None``.
+
         """
         cdef size_t html_len
         cdef object bytes_html
+        cdef lxb_html_source_origin_t origin
 
         self._is_fragment = is_fragment
         self._fragment_wrapper = NULL
         self._fragment_tag_id = LXB_TAG_DIV
         self._fragment_namespace_id = LXB_NS_HTML
         self._selector = None
+        self._source_positions = source_positions
         self._new_html_document()
         lxb_html_document_dom_opt_set(self.document, <lxb_dom_document_opt_t> int(options))
         lxb_html_document_scripting_set(self.document, scripting)
@@ -429,6 +450,16 @@ cdef class LexborHTMLParser:
         if self._is_fragment:
             self._fragment_tag_id = _fragment_tag_id_from_string(self.document, fragment_tag)
             self._fragment_namespace_id = _fragment_namespace_id_from_string(self.document, fragment_namespace)
+
+        if self._source_positions:
+            origin = (
+                LXB_HTML_SOURCE_ORIGIN_FRAGMENT
+                if self._is_fragment
+                else LXB_HTML_SOURCE_ORIGIN_DOCUMENT
+            )
+            if lxb_html_document_source_position_enable(self.document, origin) is NULL:
+                raise SelectolaxError("Can't enable source positions.")
+
         bytes_html, html_len = preprocess_input(html, encoding=encoding)
         self._parse_html(bytes_html, html_len)
         self.raw_html = bytes_html
@@ -480,7 +511,7 @@ cdef class LexborHTMLParser:
 
         with nogil:
             if self._is_fragment:
-                status = self._parse_html_fragment(html, html_len)
+                status = self._parse_html_fragment(<const lxb_char_t *> html, html_len)
             else:
                 status = self._parse_html_document(html, html_len)
 
@@ -515,7 +546,7 @@ cdef class LexborHTMLParser:
         return lxb_html_document_parse(self.document, <lxb_char_t *> html, html_len)
 
     cdef lxb_dom_node_t* _parse_fragment_wrapper_noi(
-        self, char *html, size_t html_len, lxb_status_t *out_status
+        self, const lxb_char_t *html, size_t html_len, lxb_status_t *out_status
     ) noexcept nogil:
         """Parse a fragment with this parser's context and return its wrapper.
 
@@ -562,7 +593,7 @@ cdef class LexborHTMLParser:
         out_status[0] = LXB_STATUS_OK
         return fragment_html_node
 
-    cdef inline lxb_status_t _parse_html_fragment(self, char *html, size_t html_len) noexcept nogil:
+    cdef inline lxb_status_t _parse_html_fragment(self, const lxb_char_t *html, size_t html_len) noexcept nogil:
         """Parse HTML as an HTML fragment, keeping the wrapper it is built under.
 
         No missing required elements are inserted.
@@ -646,13 +677,27 @@ cdef class LexborHTMLParser:
         cdef lxb_status_t status = LXB_STATUS_OK
         cdef lxb_dom_node_t *wrapper
         cdef lxb_dom_node_t *child
+        cdef bint origin_pushed = False
 
         if self._fragment_wrapper == NULL:
             raise SelectolaxError("Can't set inner HTML.")
 
-        wrapper = self._parse_fragment_wrapper_noi(
-            <char *> html, html_len, &status
-        )
+        # Mark this re-parse as synthetic on the registry, which is reachable
+        # through the document's user field even for fragment child documents.
+        if self._source_positions:
+            if lxb_html_document_push_source_origin(
+                self.document, LXB_HTML_SOURCE_ORIGIN_SYNTHETIC
+            ) == LXB_STATUS_OK:
+                origin_pushed = True
+
+        try:
+            wrapper = self._parse_fragment_wrapper_noi(
+                html, html_len, &status
+            )
+        finally:
+            if origin_pushed:
+                lxb_html_document_pop_source_origin(self.document)
+
         if wrapper == NULL:
             raise SelectolaxError("Can't set inner HTML.")
 
@@ -1287,6 +1332,7 @@ cdef class LexborHTMLParser:
         obj._fragment_tag_id = LXB_TAG_DIV
         obj._fragment_namespace_id = LXB_NS_HTML
         obj._selector = None
+        obj._source_positions = False
         return obj
 
     def clone(self):

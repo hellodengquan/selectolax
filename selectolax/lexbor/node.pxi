@@ -109,13 +109,32 @@ cdef inline void _replace_children(
     # addresses out again, so a retained view would read unrelated memory.
     cdef lxb_dom_node_t *wrapper
     cdef lxb_dom_node_t *child
+    cdef lxb_html_document_t *doc
+    cdef bint origin_pushed = False
 
-    wrapper = lxb_html_document_parse_fragment(
-        <lxb_html_document_t *> parent.owner_document,
-        lxb_dom_interface_element(parent),
-        html,
-        html_len,
-    )
+    # The registry hangs off the owner document (its user field), so the
+    # synthetic origin is reachable here even though a fragment document has no
+    # parser pointer of its own.
+    doc = <lxb_html_document_t *> parent.owner_document
+    if selectolax_has_source_registry(
+        (<lxb_dom_document_t *> doc).user
+    ):
+        if lxb_html_document_push_source_origin(
+            doc, LXB_HTML_SOURCE_ORIGIN_SYNTHETIC
+        ) == LXB_STATUS_OK:
+            origin_pushed = True
+
+    try:
+        wrapper = lxb_html_document_parse_fragment(
+            doc,
+            lxb_dom_interface_element(parent),
+            html,
+            html_len,
+        )
+    finally:
+        if origin_pushed:
+            lxb_html_document_pop_source_origin(doc)
+
     if wrapper == NULL:
         raise SelectolaxError("Can't set inner HTML.")
 
@@ -1548,6 +1567,30 @@ cdef class LexborNode:
             or carriage return).
         """
         return is_empty_text_node(self.node)
+
+    @property
+    def source_position(self):
+        """Return the node's span in the parsed input, or ``None``.
+
+        Only available when the parser was created with
+        ``source_positions=True``. The offsets are zero-based byte positions
+        into the UTF-8 input with a half-open range, so for a full-document
+        parse ``parser.raw_html[pos.start:pos.end]`` recovers the original
+        bytes; for a fragment parse the offsets index the fragment input.
+
+        Returns
+        -------
+        NodeSourcePosition or None
+            The recorded span, or ``None`` when the node cannot be located.
+            That is the case when positions were not enabled, or when the node
+            was produced after parsing rather than by it: nodes from
+            :meth:`LexborHTMLParser.create_node`, text inserted through the
+            mutation methods, :meth:`clone` and nodes imported from another
+            parser have no source. A node that was merely unlinked by a tree
+            edit keeps the position it was parsed with; the records live in a
+            separate pool and are not invalidated when node memory is recycled.
+        """
+        return _source_position_from_node(self.node)
 
 
 @cython.internal

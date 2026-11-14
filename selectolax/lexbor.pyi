@@ -42,6 +42,17 @@ class LexborDocumentOptions(IntFlag):
     """
     WO_EVENTS = ...
 
+class NodeSourcePosition:
+    """Byte range of a node inside the input its parser was given.
+
+    Offsets are zero-based byte positions into the UTF-8 input with a
+    half-open range, so ``raw[start:end]`` recovers the node's source span.
+    """
+
+    origin: str
+    start: int
+    end: int
+
 class LexborAttributes:
     """A dict-like object that represents attributes."""
 
@@ -886,6 +897,17 @@ class LexborNode:
             carriage return).
         """
 
+    @property
+    def source_position(self) -> NodeSourcePosition | None:
+        """Return the node's span in the parsed input, or ``None``.
+
+        Only available when the parser was created with
+        ``source_positions=True``. Nodes created or copied after parsing
+        (``create_node``, text inserted through mutation methods, ``clone``,
+        imported nodes) report ``None``. A node that was merely unlinked keeps
+        the position it was parsed with.
+        """
+
 class LexborHTMLParser:
     """The lexbor HTML parser.
 
@@ -913,6 +935,7 @@ class LexborHTMLParser:
         options: int = 0,
         encoding: bool = False,
         scripting: bool = False,
+        source_positions: bool = False,
     ) -> None:
         """Create a parser and load HTML.
 
