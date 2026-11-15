@@ -949,6 +949,79 @@ def test_merge_text_nodes_visits_every_sibling_subtree():
     assert root.css("article")[-1].text() == "p49mid49q49tail49"
 
 
+def test_repeated_merge_text_nodes_is_a_noop_on_an_unchanged_tree():
+    """A second merge on the same tree must not change structure or content."""
+    html = "<div><p><strong>J</strong>ohn</p><p>Doe</p></div>"
+    tree = LexborHTMLParser(html)
+    tree.unwrap_tags(["strong"])
+    node = tree.css_first("div", strict=True)
+    node.merge_text_nodes()
+    html_after_first = node.html
+    text_after_first = node.text(separator=" ", strip=True)
+
+    for _ in range(5):
+        node.merge_text_nodes()
+        assert node.html == html_after_first
+        assert node.text(separator=" ", strip=True) == text_after_first
+
+
+def test_merge_skips_subtrees_that_were_already_merged():
+    """A scoped merge reuses the fully merged state of a nested subtree."""
+    # The inner section is merged first; the outer document-wide merge then has
+    # to leave it alone while still merging the rest of the article.
+    tree = LexborHTMLParser(
+        "<article>"
+        "<section><b>s</b><i>x</i></section>"
+        "<p><em>a</em><strong>b</strong></p>"
+        "</article>"
+    )
+    tree.unwrap_tags(["b", "i", "em", "strong"])
+    section = tree.css_first("section", strict=True)
+    section.merge_text_nodes()
+    assert section.text() == "sx"
+
+    tree.merge_text_nodes()
+    assert section.text() == "sx"
+    assert tree.css_first("p").text() == "ab"
+    # The document-level result is identical to merging everything in one go.
+    one_shot = LexborHTMLParser(
+        "<article>"
+        "<section><b>s</b><i>x</i></section>"
+        "<p><em>a</em><strong>b</strong></p>"
+        "</article>"
+    )
+    one_shot.unwrap_tags(["b", "i", "em", "strong"])
+    one_shot.merge_text_nodes()
+    assert tree.text() == one_shot.text()
+
+
+def test_merge_markers_cover_runs_of_already_merged_siblings():
+    """Several marked sibling subtrees in a row are skipped without reentry."""
+    tree = LexborHTMLParser(
+        "<div>" + "".join(f"<p><b>a{i}</b><i>b{i}</i></p>" for i in range(20)) + "</div>"
+    )
+    tree.unwrap_tags(["b", "i"])
+    # Merge every paragraph individually, marking each subtree.
+    for paragraph in tree.css("p"):
+        paragraph.merge_text_nodes()
+    # The whole-document merge must produce the same fully merged tree even
+    # though every descendant subtree was already marked.
+    tree.merge_text_nodes()
+    for i, paragraph in enumerate(tree.css("p")):
+        assert paragraph.text() == f"a{i}b{i}"
+
+
+def test_merge_text_nodes_handles_deep_nesting_without_overflow():
+    """The iterative walk must survive nesting far deeper than the C stack."""
+    depth = 5000
+    html = "<div>" + "<span>" * depth + "x" + "</span>" * depth + "</div>"
+    tree = LexborHTMLParser(html)
+    tree.merge_text_nodes()
+    assert tree.text() == "x"
+    # The repeat takes the marked fast path and stays equally safe.
+    tree.merge_text_nodes()
+
+
 def test_strip_tags_from_root():
     html = "<body><div></div><script></script></body>"
     html_parser = LexborHTMLParser(html)

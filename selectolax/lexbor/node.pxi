@@ -456,11 +456,39 @@ cdef class LexborNode:
         text : str
             Combined textual content assembled according to the provided options.
 
+        Notes
+        -----
+        The result is cached on the parser, keyed by the node the walk starts
+        from (the fragment wrapper for a fragment root) and by every option
+        above. Repeating a call on an unchanged tree therefore performs no
+        second tree walk and no second text assembly. Any tree or attribute
+        edit bumps the parser's mutation counter and clears the cache, so a
+        subtree reference retained before an edit - including a detached one -
+        is always answered from the current structure, and changing only the
+        options simply computes and caches the corresponding alternative. The
+        cache has a fixed capacity, so the space it occupies stays bounded no
+        matter how many distinct nodes and option combinations are queried.
+
         """
         cdef unsigned char * text
         cdef LexborNode start_node = self._get_node()
         cdef lxb_dom_node_t * node = <lxb_dom_node_t *> start_node.node.first_child
-        cdef TextContainer container = TextContainer.create(separator, strip, skip_empty)
+        cdef TextContainer container
+        cdef object cache_key
+        cdef str result
+
+        cache_key = (
+            <size_t> start_node.node,
+            deep,
+            separator,
+            strip,
+            skip_empty,
+        )
+        result = self.parser._text_cache_get(cache_key)
+        if result is not None:
+            return result
+
+        container = TextContainer.create(separator, strip, skip_empty)
 
         # Both walks below start at the *children* of the node they are given,
         # never at that node itself, so a text node that is also the walk's root
@@ -486,7 +514,9 @@ cdef class LexborNode:
                             )
                 node = node.next
             container.reraise()
-            return container.text
+            result = container.text
+            self.parser._text_cache_put(cache_key, result)
+            return result
 
         lxb_dom_node_simple_walk(
             <lxb_dom_node_t *> start_node.node,
@@ -494,7 +524,9 @@ cdef class LexborNode:
             <void *> container
         )
         container.reraise()
-        return container.text
+        result = container.text
+        self.parser._text_cache_put(cache_key, result)
+        return result
 
     cdef inline LexborNode _get_node(self):
         """Return the node that tree-walking operations should start from.
@@ -948,10 +980,32 @@ cdef class LexborNode:
 
         Merges runs of adjacent text nodes, so it covers the whole fragment when
         called on the root of an HTML fragment.
+
+        Notes
+        -----
+        Every subtree the operation walks is marked as fully merged. A second
+        call on an unchanged tree finds the root already marked and returns
+        without touching any nodes, and a wider walk skips each marked subtree
+        wholesale, which keeps repeated cleaning rounds - including
+        ``merge_text_nodes`` interleaved with extractions - linear in the
+        nodes actually processed instead of the whole tree. Any ordinary tree
+        edit clears the markers, so moves, expansions and deletions are always
+        reflected, and applying the operation twice stays idempotent. Only
+        text nodes that are direct siblings are joined: block boundaries,
+        comments and other elements keep the runs apart.
         """
         cdef LexborNode start_node = self._get_node()
-        _merge_text_nodes(start_node.node)
-        self.parser._mark_mutated()
+        cdef size_t root_addr = <size_t> start_node.node
+
+        if start_node.node == NULL or node_is_removed(start_node.node):
+            return
+
+        # The root marker means its whole subtree is already in a fully merged
+        # state, so another pass has nothing to do.
+        if self.parser._is_merged_subtree(root_addr):
+            return
+        self.parser._mark_merged()
+        _merge_text_nodes(start_node.node, self.parser)
 
     def traverse(self, bool include_text = False, bool skip_empty = False):
         """Depth-first traversal starting at the current node.
@@ -1741,7 +1795,7 @@ cdef inline void _collapse_text_runs(lxb_dom_node_t *node, lexbor_mraw_t *text_m
         child = child.next
 
 
-cdef void _merge_text_nodes(lxb_dom_node_t *root):
+cdef void _merge_text_nodes(lxb_dom_node_t *root, LexborHTMLParser parser):
     if root == NULL or node_is_removed(root):
         return
 
@@ -1757,16 +1811,39 @@ cdef void _merge_text_nodes(lxb_dom_node_t *root):
     # Iterative on purpose: recursing once per nesting level overflowed the C
     # stack on deeply nested HTML. Climbing back out on parent/next needs no
     # side stack and keeps each node's children visited exactly once.
+    #
+    # A marked subtree is already fully merged, so the walk skips it
+    # wholesale - descendants and all - instead of re-traversing its nodes.
+    # Ordinary edits clear the marker set, which is what makes a surviving
+    # marker provably describe the current tree; the cost therefore grows only
+    # with the nodes that actually need processing.
     node = root
+    parser._remember_merged_subtree(<size_t> node)
     _collapse_text_runs(node, text_mraw)
 
     while True:
+        # Advance pre-order: descend to the first child when one exists,
+        # otherwise climb out of exhausted subtrees and take the next sibling.
         if node.first_child != NULL:
             node = node.first_child
         else:
-            while node != NULL and node != root and node.next == NULL:
+            while node != root and node.next == NULL:
                 node = node.parent
-            if node == NULL or node == root:
+            if node == root:
                 break
             node = node.next
+
+        # Climb out past a marked subtree and continue from the next sibling;
+        # the repeated membership test skips a run of marked siblings in one
+        # pass rather than walking them one by one.
+        while node != root and parser._is_merged_subtree(<size_t> node):
+            while node != root and node.next == NULL:
+                node = node.parent
+            if node == root:
+                break
+            node = node.next
+        if node == root:
+            break
+
+        parser._remember_merged_subtree(<size_t> node)
         _collapse_text_runs(node, text_mraw)

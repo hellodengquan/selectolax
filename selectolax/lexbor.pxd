@@ -338,9 +338,22 @@ cdef class LexborHTMLParser:
     cdef inline LexborNode _fragment_content_node(self)
     cdef void _replace_fragment_children(self, const lxb_char_t *html, size_t html_len) except *
     cdef inline void _mark_mutated(self) noexcept
+    cdef inline void _mark_merged(self) noexcept
+    cdef str _text_cache_get(self, object key)
+    cdef inline void _text_cache_put(self, object key, str value)
+    cdef bint _is_merged_subtree(self, size_t node_addr)
+    cdef inline void _remember_merged_subtree(self, size_t node_addr)
     cdef unsigned long _mutation_count
     cdef object cached_script_texts
     cdef object cached_script_srcs
+    # Per-document derived-state caches invalidated through _mutation_count.
+    # _text_cache holds the results of LexborNode.text(), keyed by the walk
+    # root's address and every option that shapes the result; _merged_subtrees
+    # is the set of node addresses whose subtrees merge_text_nodes() has
+    # already brought to a fully merged state, so a repeat on an unchanged tree
+    # is O(1) and an unchanged subtree is skipped during a wider walk.
+    cdef object _text_cache
+    cdef object _merged_subtrees
 
     @staticmethod
     cdef LexborHTMLParser from_document(lxb_html_document_t * document, bytes raw_html)

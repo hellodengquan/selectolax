@@ -1,5 +1,20 @@
 # selectolax Changelog
 
+# Unreleased
+
+- Cache `LexborNode.text()` per parser, keyed by the walk root and every extraction
+  option (`deep`, `separator`, `strip`, `skip_empty`). Repeated extraction from an
+  unchanged tree no longer re-walks the subtree or re-assembles the text; changing the
+  options returns the corresponding alternative. Any tree or attribute edit clears the
+  cache, and its size is bounded by an LRU cap so a long-lived parser cannot grow it
+  without limit.
+- Make `merge_text_nodes()` incremental: processed subtrees are marked as fully merged,
+  so a repeat on an unchanged tree is an O(1) no-op and a wider walk skips already
+  merged subtrees instead of traversing them again. Ordinary edits clear the markers, so
+  interleaved tag expansion, subtree moves and node deletions are always reflected and
+  repeated calls stay idempotent. The merged text, block/comment boundaries and script
+  handling are unchanged.
+
 # Version 1.0.2
 
 Bugfix release for 1.0.1.

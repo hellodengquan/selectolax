@@ -524,3 +524,118 @@ def test_text_and_text_lexbor_agree():
     node = tree.css_first("div")
     assert node.text() == node.text_lexbor()
     assert tree.root.text() == tree.root.text_lexbor()
+
+
+def test_repeated_text_call_is_served_from_the_cache():
+    """The second identical call must return the exact same assembled text."""
+    tree = LexborHTMLParser(
+        "<div><p>Hello <b>world</b>!</p><p>Second</p>"
+        "<script>var a=1;</script></div>"
+    )
+    node = tree.css_first("div")
+    first = node.text(separator=" ", strip=True)
+    for _ in range(10):
+        assert node.text(separator=" ", strip=True) == first
+    # The empty string is a legitimate answer and is cached like any other.
+    empty = LexborHTMLParser("<div></div>").css_first("div")
+    assert empty.text() == ""
+    assert empty.text() == ""
+
+
+def test_text_cache_keeps_option_variants_independent():
+    """Changing only the options yields each option's own correct answer."""
+    tree = LexborHTMLParser("<div><span> a </span><span> b </span></div>")
+    node = tree.css_first("div")
+    plain = node.text()
+    separated = node.text(separator="|")
+    stripped = node.text(separator="|", strip=True)
+    skipped = node.text(skip_empty=True)
+    shallow = node.text(deep=False)
+    assert plain == " a  b "
+    assert separated == " a | b "
+    assert stripped == "a|b"
+    assert skipped == " a  b "
+    assert shallow == ""
+    # Repeating any of them keeps returning the same option-specific answer.
+    for _ in range(3):
+        assert node.text() == plain
+        assert node.text(separator="|", strip=True) == stripped
+        assert node.text(deep=False) == shallow
+
+
+def test_text_cache_is_invalidated_by_every_kind_of_edit():
+    """A cached answer must never survive a tree or attribute mutation."""
+    tree = LexborHTMLParser("<div><p>one</p><p>two</p></div>")
+    node = tree.css_first("div")
+    assert node.text(separator="|") == "one|two"
+
+    tree.css_first("p").decompose()
+    assert node.text(separator="|") == "two"
+
+    tree.css_first("p").insert_after(LexborHTMLParser("<p>three</p>").root)
+    assert node.text(separator="|") == "two|three"
+
+    tree.css_first("div").inner_html = "<p>replaced</p>"
+    assert node.text() == "replaced"
+
+    # An attribute edit also invalidates, even though text() ignores attrs:
+    # invalidation is deliberately unconditional rather than content-aware.
+    tree.css_first("p").attrs["id"] = "marked"
+    assert node.text() == "replaced"
+
+
+def test_text_on_retained_subtree_reflects_latest_structure():
+    """Interleaved unwrap, move and delete update extraction from old refs."""
+    tree = LexborHTMLParser(
+        "<body><div id='a'><span>one</span><span>two</span></div>"
+        "<p id='b'>three</p></body>"
+    )
+    a = tree.css_first("#a")
+    b = tree.css_first("#b")
+    assert a.text() == "onetwo"
+    assert b.text() == "three"
+
+    a.css_first("span").unwrap()
+    b.insert_after(a.css_first("span"), move=True)
+    b.decompose()
+
+    assert "three" not in tree.text()
+    assert "two" in tree.text()
+    # The retained #a view answers from its current, now shorter subtree.
+    assert a.text() == "one"
+    # A detached view reports nothing, which is the pre-existing behavior.
+    assert b.text() == ""
+    # Options still work on the edited tree.
+    assert a.text(separator="-", strip=True) == "one"
+
+
+def test_text_cache_survives_many_distinct_queries_without_wrong_answers():
+    """LRU eviction under cache pressure must never corrupt an answer."""
+    tree = LexborHTMLParser(
+        "<div>" + "".join(f"<p>word{i}</p>" for i in range(400)) + "</div>"
+    )
+    nodes = tree.css("p")
+    for node in nodes:
+        node.text(separator="|", strip=True)
+    for index in (0, 1, 199, 200, 255, 256, 399):
+        assert nodes[index].text(separator="|", strip=True) == f"word{index}"
+
+
+def test_merge_then_edit_reopens_the_subtree_for_another_merge():
+    """Markers from merge_text_nodes are dropped as soon as the tree is edited."""
+    tree = LexborHTMLParser("<div><b>a</b><i>b</i></div>")
+    div = tree.css_first("div")
+    tree.unwrap_tags(["b", "i"])
+    div.merge_text_nodes()
+    assert div.text() == "ab"
+
+    div.insert_child(LexborHTMLParser("<span>c</span>", is_fragment=True).root)
+    div.insert_child(LexborHTMLParser("<em>d</em>", is_fragment=True).root)
+    div.unwrap_tags(["span", "em"])
+    # Before the second merge the run is still split across text nodes, so the
+    # separator exposes them; merging joins them into continuous text again.
+    assert div.text(separator=" ", strip=True) == "ab c d"
+    div.merge_text_nodes()
+    assert div.text() == "abcd"
+    div.merge_text_nodes()
+    assert div.text() == "abcd"

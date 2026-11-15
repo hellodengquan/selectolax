@@ -9,8 +9,15 @@ from cpython.mem cimport (
 )
 from enum import IntFlag
 from libc.string cimport memcpy
+from collections import OrderedDict
 
 _ENCODING = 'UTF-8'
+
+# Upper bound on the number of text() results retained per document. Entries
+# are keyed by walk root and extraction options, so a document that keeps
+# being edited - and therefore keeps invalidating the cache - can never hold
+# more than this many answers, regardless of how long it lives.
+_TEXT_CACHE_LIMIT = 256
 
 # Version of the Lexbor engine the extension was built against.
 LEXBOR_VERSION_MAJOR = _LEXBOR_VERSION_MAJOR
@@ -422,6 +429,11 @@ cdef class LexborHTMLParser:
         self._fragment_tag_id = LXB_TAG_DIV
         self._fragment_namespace_id = LXB_NS_HTML
         self._selector = None
+        self._mutation_count = 0
+        self.cached_script_texts = None
+        self.cached_script_srcs = None
+        self._text_cache = OrderedDict()
+        self._merged_subtrees = set()
         self._new_html_document()
         lxb_html_document_dom_opt_set(self.document, <lxb_dom_document_opt_t> int(options))
         lxb_html_document_scripting_set(self.document, scripting)
@@ -677,21 +689,31 @@ cdef class LexborHTMLParser:
 
         ``LexborNode`` is a view onto a mutable tree, so a value read out of
         that tree - the script text and ``src`` lookups behind
-        ``scripts_contain`` / ``script_srcs_contain`` - only stays true as long
-        as the document has not been edited since. Bumping this counter is the
-        single invalidation mechanism for them: the cached entries record the
-        counter they were built at and are discarded once it moves, so there is
-        no cache to reset and therefore none that a missed call can leave
-        stale.
+        ``scripts_contain`` / ``script_srcs_contain`` and the assembled text
+        behind ``LexborNode.text()`` - only stays true as long as the document
+        has not been edited since. Bumping this counter is the single
+        invalidation mechanism for them: the cached entries record the counter
+        they were built at and are discarded once it moves, so there is no
+        cache to reset and therefore none that a missed call can leave stale.
+
+        The caches are cleared rather than kept and compared lazily so that a
+        document which is edited continuously holds at most the entries built
+        since the last edit: the extra space stays bounded by the current tree
+        and the number of distinct extraction options, instead of growing for
+        the document's whole lifetime. The ``merge_text_nodes`` subtree
+        markers are dropped for the same reason: any edit can create fresh
+        adjacent text nodes inside a previously merged subtree, so its marker
+        no longer describes the tree.
 
         Every operation that changes the tree or an attribute must call this:
-        ``decompose``/``remove``, ``unwrap``, ``merge_text_nodes``,
-        ``replace_with``, ``insert_before``/``insert_after``/
-        ``insert_child``, the ``inner_html`` setter, ``strip_tags`` and the
-        ``attrs`` mutators. It is deliberately cheap and unconditional:
-        marking a document that did not really change only costs a recompute,
-        whereas failing to mark one that did silently answers with the previous
-        answer.
+        ``decompose``/``remove``, ``unwrap``, ``replace_with``,
+        ``insert_before``/``insert_after``/``insert_child``, the
+        ``inner_html`` setter, ``strip_tags`` and the ``attrs`` mutators.
+        ``merge_text_nodes`` goes through ``_mark_merged`` instead, so its own
+        markers survive the invalidation. It is deliberately cheap and
+        unconditional: marking a document that did not really change only costs
+        a recompute, whereas failing to mark one that did silently answers
+        with the previous answer.
 
         Over-marking does lose the cache when a mutation is applied and then
         rolled back - ``node.attrs['src'] = node.attrs['src']`` - but the tree
@@ -702,6 +724,63 @@ cdef class LexborHTMLParser:
         None
         """
         self._mutation_count += 1
+        self.cached_script_texts = None
+        self.cached_script_srcs = None
+        self._text_cache.clear()
+        self._merged_subtrees.clear()
+
+    cdef inline void _mark_merged(self) noexcept:
+        """Invalidate cached extractions after a merge, keeping merge markers.
+
+        ``merge_text_nodes`` changes the tree, so the assembled text and the
+        script lookups have to be recomputed, but it also leaves every subtree
+        it walked in the fully merged state its markers describe. Clearing the
+        markers here - as ``_mark_mutated`` does - would make the next merge
+        walk the whole tree again and defeat the incremental skip, so only the
+        value caches are dropped and the markers are kept.
+        """
+        self._mutation_count += 1
+        self.cached_script_texts = None
+        self.cached_script_srcs = None
+        self._text_cache.clear()
+
+    # A dedicated sentinel rather than None: an empty string is a legitimate
+    # cached text() answer and must not be mistaken for a missing entry.
+    _TEXT_CACHE_MISS = object()
+
+    cdef str _text_cache_get(self, object key):
+        """Return a cached text() answer, or ``None`` when the key is absent.
+
+        A hit is moved to the end of the insertion-ordered dict so the cache
+        behaves as an LRU: eviction in ``_text_cache_put`` always drops the
+        entry that was used least recently.
+        """
+        cdef object value = self._text_cache.get(key, self._TEXT_CACHE_MISS)
+        if value is self._TEXT_CACHE_MISS:
+            return None
+        self._text_cache.move_to_end(key)
+        return <str> value
+
+    cdef inline void _text_cache_put(self, object key, str value):
+        """Store a text() answer, evicting the LRU entry past the capacity."""
+        self._text_cache[key] = value
+        self._text_cache.move_to_end(key)
+        if len(self._text_cache) > _TEXT_CACHE_LIMIT:
+            self._text_cache.pop(next(iter(self._text_cache)))
+
+    cdef bint _is_merged_subtree(self, size_t node_addr):
+        """Whether merge_text_nodes() has already fully merged this subtree.
+
+        Membership is sufficient because every non-merge edit clears the set:
+        a surviving address always names a live node whose subtree still has no
+        adjacent text nodes. A freed node's address can only match after the
+        pool reuses it for a fresh node, and every such reallocation happens
+        inside an edit that cleared the set first.
+        """
+        return node_addr in self._merged_subtrees
+
+    cdef inline void _remember_merged_subtree(self, size_t node_addr):
+        self._merged_subtrees.add(node_addr)
 
     def __dealloc__(self):
         """Release the underlying Lexbor HTML document.
@@ -1280,8 +1359,11 @@ cdef class LexborHTMLParser:
         obj = <LexborHTMLParser> LexborHTMLParser.__new__(LexborHTMLParser)
         obj.document = document
         obj.raw_html = raw_html
+        obj._mutation_count = 0
         obj.cached_script_texts = None
         obj.cached_script_srcs = None
+        obj._text_cache = OrderedDict()
+        obj._merged_subtrees = set()
         obj._is_fragment = False
         obj._fragment_wrapper = NULL
         obj._fragment_tag_id = LXB_TAG_DIV
