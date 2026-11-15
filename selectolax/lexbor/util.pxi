@@ -1,5 +1,3 @@
-include "../utils.pxi"
-
 from cpython.unicode cimport PyUnicode_DecodeUTF8
 
 cdef inline str _decode_utf8(const lxb_char_t *data, size_t length):

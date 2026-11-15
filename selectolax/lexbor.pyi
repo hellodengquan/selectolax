@@ -999,7 +999,15 @@ class LexborHTMLParser:
 
             Input that declares nothing is decoded as UTF-8, not as the
             windows-1252 a browser would fall back to, so that turning this on
-            cannot reinterpret a document that already parsed correctly.
+            cannot reinterpret a document that already parsed correctly. A
+            declaration naming an encoding that cannot read the stream - an
+            unknown label, a binary or text-transform pseudo-encoding such as
+            ``base64`` or ``rot13``, or a codec such as ``utf-32`` that refuses
+            a BOM-less stream - is ignored the same way.
+
+            A byte-order mark is consumed rather than parsed as text, and the
+            same rules apply to ``is_fragment=True``: the bytes are resolved
+            before the parse routine is chosen.
 
             The encoding is resolved before parsing, so this costs one extra pass
             over non-UTF-8 input and nothing at all for UTF-8.
