@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Field extraction fixture</title>
+  <!-- a comment between head elements: it must not affect child indices -->
+  <template id="card-template">
+    <article class="card">
+      <h3>Template card</h3>
+      <p class="desc">Templated description</p>
+      <a href="/t">templated link</a>
+    </article>
+  </template>
+</head>
+<body>
+  <main id="main">
+    <section id="articles">
+      <!-- comments sit between siblings but must not count as children -->
+      <article class="post" data-n="a1">
+        <h2>Alpha release</h2>
+        <p class="summary">First summary</p>
+        <p class="summary">Second summary</p>
+        <a class="link" href="/a1">read more</a>
+      </article>
+      <article class="post" data-n="a2">
+        <h2>Beta release</h2>
+        <p class="summary">Beta summary</p>
+        <a class="link" href="/a2">read more</a>
+      </article>
+      <article class="post sponsored" data-n="a3">
+        <h2>Gamma release</h2>
+        <p class="summary">Gamma summary</p>
+        <span></span>
+      </article>
+    </section>
+    <section id="cards">
+      <div class="card" data-n="c1">
+        <span class="tag">news</span>
+        <p>Card one</p>
+      </div>
+      <div class="card" data-n="c2">
+        <span class="tag">blog</span>
+        <p>Card two</p>
+      </div>
+      <div class="card sponsored" data-n="c3">
+        <span class="tag">ad</span>
+        <p>Card three</p>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
