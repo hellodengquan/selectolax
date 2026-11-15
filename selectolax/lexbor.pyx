@@ -12,6 +12,19 @@ from libc.string cimport memcpy
 
 _ENCODING = 'UTF-8'
 
+# Bounds on the per-parser bookkeeping behind text() reuse and repeat
+# merge_text_nodes() calls. They are size caps rather than time-based so that a
+# page edited for a long time cannot make the extra memory grow with the number
+# of edits: once a cap is reached entries are evicted oldest-first (or, for the
+# merge records, dropped), and the only cost is recomputing.
+_TEXT_CACHE_CHARS = 1 << 16
+_TEXT_CACHE_ENTRIES = 1 << 12
+_MERGE_SCOPE_LIMIT = 1 << 10
+# Cap on versioned nodes. Reaching it clears the version table and the text
+# cache together, so the two never disagree; the only cost is that the next
+# extraction recomputes.
+_TEXT_VERSION_LIMIT = 1 << 16
+
 # Version of the Lexbor engine the extension was built against.
 LEXBOR_VERSION_MAJOR = _LEXBOR_VERSION_MAJOR
 LEXBOR_VERSION_MINOR = _LEXBOR_VERSION_MINOR
@@ -422,6 +435,12 @@ cdef class LexborHTMLParser:
         self._fragment_tag_id = LXB_TAG_DIV
         self._fragment_namespace_id = LXB_NS_HTML
         self._selector = None
+        self._mutation_count = 0
+        self._text_cache = None
+        self._text_cache_chars = 0
+        self._merge_scopes = None
+        self._text_versions = None
+        self._text_version = 0
         self._new_html_document()
         lxb_html_document_dom_opt_set(self.document, <lxb_dom_document_opt_t> int(options))
         lxb_html_document_scripting_set(self.document, scripting)
@@ -658,6 +677,7 @@ cdef class LexborHTMLParser:
 
         # Unlinked rather than destroyed, like _replace_children() does with an
         # element's old children: views the caller holds stay valid but detached.
+        self._note_subtree_change(self._fragment_wrapper)
         while self._fragment_wrapper.first_child != NULL:
             lxb_dom_node_remove(self._fragment_wrapper.first_child)
 
@@ -697,11 +717,222 @@ cdef class LexborHTMLParser:
         rolled back - ``node.attrs['src'] = node.attrs['src']`` - but the tree
         is unchanged in that case, so the next lookup just repopulates it.
 
+        The ``text()`` result cache is *not* tied to this counter: it is keyed
+        per subtree by the version of that subtree's root, see
+        ``_note_subtree_change``. A mutation that leaves a subtree untouched
+        therefore keeps that subtree's cached extraction valid, while the script
+        lookups, which scan for a different node set on every call, are simply
+        dropped.
+
         Returns
         -------
         None
         """
         self._mutation_count += 1
+
+    cdef inline unsigned long long _version_of(self, lxb_dom_node_t *node) except? 0:
+        """Return ``node``'s version token, minting one the first time it is read.
+
+        Each cached extraction is keyed by the version of the node it was rooted
+        at, so every scope needs a token. Tokens are kept per parser in
+        ``_text_versions``, keyed by the node address: the document owns every
+        node for the parser's whole lifetime (edits unlink nodes, they never
+        free them until the document is destroyed), so an address stays attached
+        to the same node. Keeping the table here rather than in the node's
+        ``user`` field avoids a token leaking in through Lexbor's node copy,
+        which preserves ``user`` across documents.
+
+        Parameters
+        ----------
+        node : lxb_dom_node_t *
+            Node whose token is wanted.
+
+        Returns
+        -------
+        unsigned long long
+            The node's current version.
+        """
+        if self._text_versions is None:
+            self._text_versions = {}
+        cdef object version = self._text_versions.get(<size_t> node)
+        if version is not None:
+            return <unsigned long long> version
+        return self._mint_version(node)
+
+    cdef inline unsigned long long _next_version(self) except? 0:
+        """Return the next version value, resetting the tables when full.
+
+        The version table and the extraction cache are cleared together here so
+        that no cache entry can outlive the versions it was keyed by: keeping
+        them in lockstep is what makes a cap on the table safe rather than a
+        source of stale answers.
+        """
+        if self._text_versions is None:
+            self._text_versions = {}
+        if len(self._text_versions) >= _TEXT_VERSION_LIMIT:
+            self._text_versions.clear()
+            self._drop_text_cache()
+        self._text_version += 1
+        return <unsigned long long> self._text_version
+
+    cdef inline unsigned long long _mint_version(self, lxb_dom_node_t *node) except? 0:
+        """Assign and return a fresh version token for ``node``.
+
+        The counter only ever increases between resets, so a value is never
+        reused within one table's lifetime: a version read before an edit can
+        never equal one written after it, which is what makes a cache hit mean
+        "this subtree and these options, unchanged".
+        """
+        cdef unsigned long long version = self._next_version()
+        self._text_versions[<size_t> node] = version
+        return version
+
+    cdef inline void _note_subtree_change(self, lxb_dom_node_t *node) except *:
+        """Stamp ``node`` and every ancestor with a new version token.
+
+        A cached extraction rooted at ``R`` can only change when the edit lands
+        inside ``R``'s subtree, which is exactly when ``R`` is ``node`` or one
+        of its ancestors. Stamping along that spine therefore invalidates every
+        read that could be affected while leaving reads of untouched sibling
+        subtrees - the common case when a page is cleaned section by section -
+        valid and cheap to reuse.
+
+        Callers pass the node *before* detaching it: removal clears the parent
+        links this walk follows, and a detached node's own subtree is still read
+        through the view the caller holds, so it needs the stamp too.
+
+        Parameters
+        ----------
+        node : lxb_dom_node_t *
+            Node that is about to change, be moved, or be detached.
+
+        Returns
+        -------
+        None
+        """
+        if node == NULL:
+            return
+        cdef unsigned long long version = self._next_version()
+        cdef lxb_dom_node_t *cur = node
+        while cur != NULL:
+            self._text_versions[<size_t> cur] = version
+            cur = cur.parent
+
+    cdef inline object _cached_text_result(self, lxb_dom_node_t *scope, tuple key):
+        """Return the extraction of ``scope`` cached under ``key``, or ``None``.
+
+        ``key`` carries every option that affects the result - ``deep``,
+        ``separator``, ``strip`` and ``skip_empty`` - so changing an option
+        never answers with a result assembled for another option set: the old
+        entry simply does not match and the new one is computed and stored
+        alongside it.
+        """
+        if self._text_cache is None or self._text_versions is None:
+            return None
+        cdef object version = self._text_versions.get(<size_t> scope)
+        if version is None:
+            # Reading a subtree that has never been touched still needs a token
+            # for its entry to be reusable, so mint one.
+            version = self._mint_version(scope)
+        return self._text_cache.get(
+            (<size_t> scope, <unsigned long long> version, key)
+        )
+
+    cdef inline void _cache_text_result(self, lxb_dom_node_t *scope, tuple key, str value) except *:
+        """Store ``value`` as the extraction of ``scope`` under ``key``.
+
+        The cache is a convenience, so its footprint is capped both by the total
+        length of the strings it holds and by the number of entries. Both caps
+        matter: a page of empty elements contributes many zero-length results
+        that would never trip the character cap. Once either cap is exceeded,
+        entries are evicted oldest-first; an eviction only costs a recompute.
+        """
+        # Mint a token first so the entry is keyed by a stable version even for
+        # a node that has never been edited.
+        cdef unsigned long long version = self._version_of(scope)
+        if self._text_cache is None:
+            self._text_cache = {}
+        entry_key = (<size_t> scope, <unsigned long long> version, key)
+        previous = self._text_cache.get(entry_key)
+        if previous is not None:
+            self._text_cache_chars -= len(previous)
+        self._text_cache[entry_key] = value
+        self._text_cache_chars += len(value)
+        while (
+            (self._text_cache_chars > _TEXT_CACHE_CHARS
+             or len(self._text_cache) > _TEXT_CACHE_ENTRIES)
+            and self._text_cache
+        ):
+            oldest = next(iter(self._text_cache))
+            self._text_cache_chars -= len(self._text_cache.pop(oldest))
+
+    cdef inline void _drop_text_cache(self) noexcept:
+        """Drop every cached extraction, keeping the node version tokens.
+
+        Used when a change touches many nodes at once and so cannot be
+        expressed as a stamp on a single spine: merging text nodes rewrites the
+        children of every element inside the scope, including scopes read below
+        it. Clearing the table is bounded work and the next read simply
+        recomputes.
+        """
+        if self._text_cache is not None:
+            self._text_cache.clear()
+        self._text_cache_chars = 0
+
+    cdef inline bint _merge_scope_covered(self, lxb_dom_node_t *scope) noexcept:
+        """Whether ``scope``'s subtree is already merged as of the last edit.
+
+        ``merge_text_nodes()`` is idempotent, so a repeat call has nothing to
+        do. Recording each merged scope together with the mutation counter it
+        was merged at lets the repeat - and any call on a node inside an already
+        merged scope - return without walking the subtree again: if an ancestor
+        was merged since the last edit, everything below it was merged too.
+
+        Any edit moves the counter on and makes the next call walk. Bumping a
+        counter for an edit that does not actually split text (for instance
+        changing an attribute) only costs one extra walk, never a wrong answer.
+        """
+        if scope == NULL or not self._merge_scopes:
+            return False
+        cdef lxb_dom_node_t *cur = scope
+        while cur != NULL:
+            if self._merge_scopes.get(<size_t> cur) == self._mutation_count:
+                return True
+            cur = cur.parent
+        return False
+
+    cdef inline void _record_merge_scope(self, lxb_dom_node_t *scope) except *:
+        """Remember that ``scope``'s subtree is merged as of the current edit count."""
+        if scope == NULL:
+            return
+        if self._merge_scopes is None:
+            self._merge_scopes = {}
+        if len(self._merge_scopes) >= _MERGE_SCOPE_LIMIT:
+            self._merge_scopes.pop(next(iter(self._merge_scopes)))
+        self._merge_scopes[<size_t> scope] = self._mutation_count
+
+    def _text_cache_size_for_tests(self):
+        """Return ``(characters, entries)`` held by the extraction cache.
+
+        Exposed so tests can assert the cache's footprint stays bounded; it is
+        not part of the public API and takes no part in extraction.
+        """
+        if self._text_cache is None:
+            return (0, 0)
+        return (self._text_cache_chars, len(self._text_cache))
+
+    def _clear_text_cache_for_tests(self):
+        """Drop every cached extraction so the next read is computed afresh.
+
+        Exposed so tests can show that a cached answer equals the answer the
+        same tree gives with the cache cold; it is not part of the public API.
+        """
+        self._drop_text_cache()
+        if self._text_versions is not None:
+            self._text_versions.clear()
+        if self._merge_scopes is not None:
+            self._merge_scopes.clear()
+
 
     def __dealloc__(self):
         """Release the underlying Lexbor HTML document.
@@ -1090,8 +1321,14 @@ cdef class LexborHTMLParser:
 
             for i in range(lxb_dom_collection_length_noi(collection)):
                 element = lxb_dom_collection_element_noi(collection, i)
+                # Stamp before unlinking; the removal clears parent links.
+                self._note_subtree_change(<lxb_dom_node_t *> element)
                 if recursive:
                     node_remove_deep(<lxb_dom_node_t *> element)
+                    # Every descendant was unlinked as well, and a view the
+                    # caller holds of one is not on any stamped spine, so drop
+                    # the extraction cache instead of letting one answer stale.
+                    self._drop_text_cache()
                 else:
                     lxb_dom_node_remove(<lxb_dom_node_t *> element)
                 _maybe_refresh_head_body(self.document, <lxb_dom_node_t *> element)
@@ -1287,6 +1524,12 @@ cdef class LexborHTMLParser:
         obj._fragment_tag_id = LXB_TAG_DIV
         obj._fragment_namespace_id = LXB_NS_HTML
         obj._selector = None
+        obj._mutation_count = 0
+        obj._text_cache = None
+        obj._text_cache_chars = 0
+        obj._merge_scopes = None
+        obj._text_versions = None
+        obj._text_version = 0
         return obj
 
     def clone(self):

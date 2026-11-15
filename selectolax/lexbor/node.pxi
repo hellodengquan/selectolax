@@ -68,6 +68,10 @@ cdef lxb_dom_node_t *_node_to_insert(LexborNode target, LexborNode value, bint m
     if move and value.parser is target.parser:
         if _is_inclusive_ancestor(<lxb_dom_node_t *> value.node, target.node):
             raise SelectolaxError("Can't move a node into its own subtree.")
+        # Stamp before unlinking: this walks up through the node's *old*
+        # ancestors, so a cached extraction of its previous parent is dropped
+        # too. The caller stamps the target's spine for the new position.
+        target.parser._note_subtree_change(<lxb_dom_node_t *> value.node)
         lxb_dom_node_remove(<lxb_dom_node_t *> value.node)
         return <lxb_dom_node_t *> value.node
 
@@ -79,6 +83,8 @@ cdef lxb_dom_node_t *_node_to_insert(LexborNode target, LexborNode value, bint m
     if new_node == NULL:
         raise SelectolaxError("Can't create a new node")
     if move:
+        # Same ordering as above: stamp the source side before its links go.
+        value.parser._note_subtree_change(<lxb_dom_node_t *> value.node)
         lxb_dom_node_remove(<lxb_dom_node_t *> value.node)
         value.parser._mark_mutated()
     return new_node
@@ -456,11 +462,30 @@ cdef class LexborNode:
         text : str
             Combined textual content assembled according to the provided options.
 
+        Repeating the call on a subtree that has not been edited since is cheap:
+        the previous result is reused. Because the cache is keyed per subtree and
+        per option set, an edit to a sibling subtree does not cost this one a
+        recompute, and changing an option returns the result for the new options
+        rather than a stale one.
         """
         cdef unsigned char * text
         cdef LexborNode start_node = self._get_node()
+        cdef lxb_dom_node_t * scope = <lxb_dom_node_t *> start_node.node
         cdef lxb_dom_node_t * node = <lxb_dom_node_t *> start_node.node.first_child
-        cdef TextContainer container = TextContainer.create(separator, strip, skip_empty)
+        cdef TextContainer container
+        cdef object cached
+        cdef object result
+        # Options that change the result are part of the key, so narrowing or
+        # widening the extraction never answers from an entry built for another
+        # option set. ``deep`` is in the key because the two walks cover
+        # different nodes.
+        cdef tuple key = (deep, separator, strip, skip_empty)
+
+        cached = self.parser._cached_text_result(scope, key)
+        if cached is not None:
+            return cached
+
+        container = TextContainer.create(separator, strip, skip_empty)
 
         # Both walks below start at the *children* of the node they are given,
         # never at that node itself, so a text node that is also the walk's root
@@ -486,7 +511,9 @@ cdef class LexborNode:
                             )
                 node = node.next
             container.reraise()
-            return container.text
+            result = container.text
+            self.parser._cache_text_result(scope, key, result)
+            return result
 
         lxb_dom_node_simple_walk(
             <lxb_dom_node_t *> start_node.node,
@@ -494,7 +521,9 @@ cdef class LexborNode:
             <void *> container
         )
         container.reraise()
-        return container.text
+        result = container.text
+        self.parser._cache_text_result(scope, key, result)
+        return result
 
     cdef inline LexborNode _get_node(self):
         """Return the node that tree-walking operations should start from.
@@ -654,8 +683,17 @@ cdef class LexborNode:
         if self.node == <lxb_dom_node_t *> lxb_dom_document_root(&self.parser.document.dom_document):
             raise SelectolaxError("Decomposing the root node is not allowed.")
 
+        # Stamp before unlinking: the parent links `_note_subtree_change` walks
+        # are cleared by the removal.
+        self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
+
         if recursive:
             node_remove_deep(<lxb_dom_node_t *> self.node)
+            # ``node_remove_deep`` unlinks every descendant too, so a view the
+            # caller still holds of one of them now describes an emptied node. No
+            # spine stamp reaches those, so drop every cached read at once rather
+            # than let a descendant answer with its pre-removal text.
+            self.parser._drop_text_cache()
         else:
             lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
 
@@ -877,12 +915,18 @@ cdef class LexborNode:
 
         if current_node == NULL:
             if delete_empty:
+                self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
                 lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
                 _maybe_refresh_head_body(
                     self.parser.document, <lxb_dom_node_t *> self.node
                 )
                 self.parser._mark_mutated()
             return
+
+        # Stamping the node covers both the parent (whose child list changes) and
+        # the node itself; the moved children keep their own version, but their
+        # new siblings' parent is already stamped.
+        self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
 
         while current_node != NULL:
             next_node = current_node.next
@@ -948,10 +992,34 @@ cdef class LexborNode:
 
         Merges runs of adjacent text nodes, so it covers the whole fragment when
         called on the root of an HTML fragment.
+
+        Only text nodes that are siblings are merged, so a word broken apart by
+        an inline tag becomes one text node again once that tag is unwrapped,
+        while a block element or a comment between two text nodes still separates
+        them. Script and style contents follow the same rule as any other text:
+        they are merged only within their own parent. Only direct text siblings
+        are candidates, so a node nested inside a child element is never folded
+        into its parent's run.
+
+        Repeating the call without editing the page is a no-op and returns
+        without walking the subtree again.
         """
         cdef LexborNode start_node = self._get_node()
-        _merge_text_nodes(start_node.node)
-        self.parser._mark_mutated()
+        cdef lxb_dom_node_t *scope = <lxb_dom_node_t *> start_node.node
+        cdef bint changed
+        if self.parser._merge_scope_covered(scope):
+            return
+        changed = _merge_text_nodes(scope)
+        if changed:
+            # Merging rewrites the children of many elements inside the scope,
+            # which no single version stamp can express, so every cached
+            # extraction is dropped rather than risk one describing a pre-merge
+            # tree.
+            self.parser._drop_text_cache()
+            self.parser._mark_mutated()
+        # Record at the counter the page is at *after* any bump, so a repeat call
+        # that changed nothing and a call that did both see the same marker.
+        self.parser._record_merge_scope(scope)
 
     def traverse(self, bool include_text = False, bool skip_empty = False):
         """Depth-first traversal starting at the current node.
@@ -1064,12 +1132,14 @@ cdef class LexborNode:
             )
             if new_node == NULL:
                 raise SelectolaxError("Can't create a new node")
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             lxb_dom_node_insert_before(self.node, new_node)
             lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
             _maybe_refresh_head_body(
                 self.parser.document, <lxb_dom_node_t *> self.node
             )
         elif isinstance(value, LexborNode):
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             new_node = _node_to_insert(self, value, move)
             lxb_dom_node_insert_before(self.node, new_node)
             lxb_dom_node_remove(<lxb_dom_node_t *> self.node)
@@ -1120,8 +1190,10 @@ cdef class LexborNode:
             )
             if new_node == NULL:
                 raise SelectolaxError("Can't create a new node")
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             lxb_dom_node_insert_before(self.node, new_node)
         elif isinstance(value, LexborNode):
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             new_node = _node_to_insert(self, value, move)
             lxb_dom_node_insert_before(self.node, new_node)
         else:
@@ -1168,8 +1240,10 @@ cdef class LexborNode:
             )
             if new_node == NULL:
                 raise SelectolaxError("Can't create a new node")
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             lxb_dom_node_insert_after(self.node, new_node)
         elif isinstance(value, LexborNode):
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             new_node = _node_to_insert(self, value, move)
             lxb_dom_node_insert_after(self.node, new_node)
         else:
@@ -1216,8 +1290,10 @@ cdef class LexborNode:
             )
             if new_node == NULL:
                 raise SelectolaxError("Can't create a new node")
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             lxb_dom_node_insert_child(self.node, new_node)
         elif isinstance(value, LexborNode):
+            self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
             new_node = _node_to_insert(self, value, move)
             lxb_dom_node_insert_child(self.node, new_node)
         else:
@@ -1488,6 +1564,9 @@ cdef class LexborNode:
             raise TypeError("inner_html is only available for element nodes")
 
         bytes_val = <bytes> html.encode("utf-8")
+        # The node's own subtree is replaced, so stamping it invalidates every
+        # read rooted at it or below it.
+        self.parser._note_subtree_change(<lxb_dom_node_t *> self.node)
         _replace_children(
             <lxb_dom_node_t *> self.node,
             <lxb_char_t *> bytes_val,
@@ -1719,12 +1798,19 @@ cdef inline lxb_html_serialize_opt_t _html_pretty_options(
 cdef inline bint _is_node_type(lxb_dom_node_t *node, lxb_dom_node_type_t expected_type):
     return node != NULL and node.type == expected_type
 
-cdef inline void _collapse_text_runs(lxb_dom_node_t *node, lexbor_mraw_t *text_mraw):
-    """Collapse each run of adjacent text children into the run's first node."""
+cdef inline bint _collapse_text_runs(lxb_dom_node_t *node, lexbor_mraw_t *text_mraw):
+    """Collapse each run of adjacent text children into the run's first node.
+
+    Returns ``True`` when at least one run had more than one text child and was
+    collapsed. All text is located next to ``child``; ``lexbor_str_append``
+    grows the buffer geometrically through ``mraw``, so folding a long run of
+    short fragments in costs total text length, not length times fragments.
+    """
     cdef lxb_dom_node_t *child
     cdef lxb_dom_node_t *next_node
     cdef lexbor_str_t *left_str
     cdef lexbor_str_t *right_str
+    cdef bint changed = False
 
     child = node.first_child
     while child != NULL:
@@ -1736,17 +1822,29 @@ cdef inline void _collapse_text_runs(lxb_dom_node_t *node, lexbor_mraw_t *text_m
                 next_node = child.next
                 right_str = &(<lxb_dom_text_t *> next_node).char_data.data
                 if lexbor_str_append(left_str, text_mraw, right_str.data, right_str.length) == NULL:
+                    # Allocation failed; stop folding this run but keep going,
+                    # so one bad run cannot leave the rest unmerged.
                     break
                 lxb_dom_node_remove(next_node)
+                changed = True
         child = child.next
+    return changed
 
 
-cdef void _merge_text_nodes(lxb_dom_node_t *root):
+cdef bint _merge_text_nodes(lxb_dom_node_t *root):
+    """Merge adjacent text siblings throughout ``root``'s subtree.
+
+    Returns ``True`` when any run of adjacent text nodes was collapsed. Work
+    is proportional to the nodes actually visited: each element's child list is
+    walked once and its text runs folded in place, and no extra per-node
+    bookkeeping is kept between calls.
+    """
     if root == NULL or node_is_removed(root):
-        return
+        return False
 
     cdef lxb_dom_node_t *node
     cdef lexbor_mraw_t *text_mraw
+    cdef bint changed = False
 
     # Text nodes own their character data inline, so a run of adjacent text
     # nodes can be collapsed straight into the first one. Appending in place
@@ -1758,7 +1856,8 @@ cdef void _merge_text_nodes(lxb_dom_node_t *root):
     # stack on deeply nested HTML. Climbing back out on parent/next needs no
     # side stack and keeps each node's children visited exactly once.
     node = root
-    _collapse_text_runs(node, text_mraw)
+    if _collapse_text_runs(node, text_mraw):
+        changed = True
 
     while True:
         if node.first_child != NULL:
@@ -1769,4 +1868,6 @@ cdef void _merge_text_nodes(lxb_dom_node_t *root):
             if node == NULL or node == root:
                 break
             node = node.next
-        _collapse_text_runs(node, text_mraw)
+        if _collapse_text_runs(node, text_mraw):
+            changed = True
+    return changed

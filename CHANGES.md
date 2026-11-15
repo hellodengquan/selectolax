@@ -4,6 +4,17 @@
 
 Bugfix release for 1.0.1.
 
+- Reuse the result of `text()` while a page is cleaned and re-read: repeated extractions of an
+  unchanged subtree return the same string without walking it again, and a subtree that an edit
+  did not touch keeps its cached result even when a sibling subtree changes. The cache is keyed
+  per subtree and per option set (`deep`, `separator`, `strip`, `skip_empty`), so a changed option
+  returns the newly computed result, and its footprint is capped in characters and entries so that
+  sustained edits cannot make the extra memory grow without bound.
+- `merge_text_nodes()` is linear in the nodes it visits and in the text length, and merges only
+  adjacent sibling text nodes, so a word split by an unwrapped inline tag is rejoined while a
+  block element, a comment or a node nested in a child element still separates runs. Script and
+  style contents follow the same sibling rule. A repeated call on an unchanged scope is a no-op
+  that returns without walking the subtree again.
 - Fix `insert_child()`, `insert_before()`, `insert_after()` and `replace_with()` move nodes.
 - Add the `move` parameter to `insert_child()`, `insert_before()`, `insert_after()` and
   `replace_with()`. Pass `move=True` to move the node instead of copying it: the node is

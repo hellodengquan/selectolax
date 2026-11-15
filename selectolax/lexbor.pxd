@@ -338,9 +338,23 @@ cdef class LexborHTMLParser:
     cdef inline LexborNode _fragment_content_node(self)
     cdef void _replace_fragment_children(self, const lxb_char_t *html, size_t html_len) except *
     cdef inline void _mark_mutated(self) noexcept
+    cdef inline unsigned long long _version_of(self, lxb_dom_node_t *node) except? 0
+    cdef inline unsigned long long _next_version(self) except? 0
+    cdef inline unsigned long long _mint_version(self, lxb_dom_node_t *node) except? 0
+    cdef inline void _note_subtree_change(self, lxb_dom_node_t *node) except *
+    cdef inline object _cached_text_result(self, lxb_dom_node_t *scope, tuple key)
+    cdef inline void _cache_text_result(self, lxb_dom_node_t *scope, tuple key, str value) except *
+    cdef inline void _drop_text_cache(self) noexcept
+    cdef inline bint _merge_scope_covered(self, lxb_dom_node_t *scope) noexcept
+    cdef inline void _record_merge_scope(self, lxb_dom_node_t *scope) except *
     cdef unsigned long _mutation_count
     cdef object cached_script_texts
     cdef object cached_script_srcs
+    cdef dict _text_cache
+    cdef Py_ssize_t _text_cache_chars
+    cdef dict _merge_scopes
+    cdef dict _text_versions
+    cdef unsigned long long _text_version
 
     @staticmethod
     cdef LexborHTMLParser from_document(lxb_html_document_t * document, bytes raw_html)

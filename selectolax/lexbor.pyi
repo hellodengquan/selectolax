@@ -228,6 +228,12 @@ class LexborNode:
         -------
         text : str
             Combined textual content assembled according to the provided options.
+
+        Repeating the call on a subtree that has not been edited since is cheap:
+        the previous result is reused. Because the cache is keyed per subtree and
+        per option set, an edit to a sibling subtree does not cost this one a
+        recompute, and changing an option returns the result for the new options
+        rather than a stale one.
         """
 
     def css(self, query: str) -> list[LexborNode]:
@@ -511,6 +517,11 @@ class LexborNode:
         >>> node.merge_text_nodes()
         >>> tree.text(deep=True, separator=" ", strip=True)
         "John Doe"
+
+        Only adjacent sibling text nodes are merged, so unwrapping an inline tag
+        rejoins the word it split while a block element, a comment or a node
+        nested in a child element still separates runs. A repeated call on an
+        unchanged scope is a no-op.
         """
 
     def traverse(
@@ -1391,6 +1402,11 @@ class LexborHTMLParser:
         >>> node.merge_text_nodes()
         >>> tree.text(deep=True, separator=" ", strip=True)
         "John Doe"
+
+        Only adjacent sibling text nodes are merged, so unwrapping an inline tag
+        rejoins the word it split while a block element, a comment or a node
+        nested in a child element still separates runs. A repeated call on an
+        unchanged scope is a no-op.
 
         Returns
         -------
